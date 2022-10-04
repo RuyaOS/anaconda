@@ -1,0 +1,443 @@
+#!/usr/bin/python3
+#vim: set fileencoding=utf8
+# parse-kickstart - read a kickstart file and emit equivalent dracut boot args
+#
+# Designed to run inside the dracut initramfs environment.
+# Requires python 2.7 or later.
+#
+#
+# Copyright (C) 2012-2014 Red Hat, Inc.
+#
+# This copyrighted material is made available to anyone wishing to use,
+# modify, copy, or redistribute it subject to the terms and conditions of
+# the GNU General Public License v.2, or (at your option) any later version.
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY expressed or implied, including the implied warranties of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General
+# Public License for more details.  You should have received a copy of the
+# GNU General Public License along with this program; if not, write to the
+# Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
+# 02110-1301, USA.  Any Red Hat trademarks that are incorporated in the
+# source code or documentation are not subject to the GNU General Public
+# License and may only be used or replicated with the express permission of
+# Red Hat, Inc.
+
+## XXX HACK - Monkeypatch os.urandom to use /dev/urandom not getrandom()
+## XXX HACK - which will block until pool is initialized which takes forever
+import os
+def ks_random(num_bytes):
+    return open("/dev/urandom", "rb").read(num_bytes)
+os.urandom = ks_random
+
+import sys
+import logging
+import glob
+from pykickstart.parser import KickstartParser, preprocessKickstart
+from pykickstart.sections import NullSection
+from pykickstart.version import returnClassForVersion
+from pykickstart.errors import KickstartError
+# pylint: disable=wildcard-import,unused-wildcard-import
+from pykickstart.constants import *
+from collections import OrderedDict
+
+# Import the kickstart version.
+from pykickstart.version import F36 as VERSION
+
+# Import all kickstart commands as version-less.
+from pykickstart.commands.cdrom import FC3_Cdrom as Cdrom
+from pykickstart.commands.harddrive import F33_HardDrive as HardDrive
+from pykickstart.commands.hmc import F28_Hmc as Hmc
+from pykickstart.commands.nfs import FC6_NFS as NFS
+from pykickstart.commands.url import F30_Url as Url
+from pykickstart.commands.updates import F34_Updates as Updates
+from pykickstart.commands.mediacheck import FC4_MediaCheck as MediaCheck
+from pykickstart.commands.driverdisk import F14_DriverDisk as DriverDisk
+from pykickstart.commands.network import F27_Network as Network
+from pykickstart.commands.displaymode import F26_DisplayMode as DisplayMode
+from pykickstart.commands.bootloader import F34_Bootloader as Bootloader
+
+# Default logging: none
+log = logging.getLogger('parse-kickstart').addHandler(logging.NullHandler())
+
+TMPDIR = "/tmp"
+# uapi/linux/if_arp.h
+##define ARPHRD_ETHER    1               /* Ethernet 10Mbps              */
+##define ARPHRD_INFINIBAND 32            /* InfiniBand                   */
+ARPHRD_ETHER = "1"
+ARPHRD_INFINIBAND = "32"
+
+# Helper function for reading simple files in /sys
+def readsysfile(f):
+    '''Return the contents of f, or "" if missing.'''
+    try:
+        val = open(f).readline().strip()
+    except OSError:
+        val = ""
+    return val
+
+def read_cmdline(f):
+    '''Returns an OrderedDict containing key-value pairs from a file with
+    boot arguments (e.g. /proc/cmdline).'''
+    args = OrderedDict()
+    try:
+        lines = open(f).readlines()
+    except OSError:
+        lines = []
+    # pylint: disable=redefined-outer-name
+    for line in lines:
+        for arg in line.split():
+            k,_,v = arg.partition("=")
+            if k not in args:
+                args[k] = [v]
+            else:
+                args[k].append(v)
+    return args
+
+def first_device_with_link():
+    for dev_dir in sorted(glob.glob("/sys/class/net/*")):
+        try:
+            with open(dev_dir+"/type") as f:
+                if f.read().strip() not in (ARPHRD_ETHER, ARPHRD_INFINIBAND):
+                    continue
+            with open(dev_dir+"/carrier") as f:
+                if f.read().strip() == ARPHRD_ETHER:
+                    return os.path.basename(dev_dir)
+        except OSError:
+            pass
+
+    return ""
+
+def setting_only_hostname(net, args):
+    return net.hostname and (len(args) == 2 or (len(args) == 3 and "--hostname" in args))
+
+proc_cmdline = read_cmdline("/proc/cmdline")
+
+class DracutArgsMixin(object):
+    """A mixin class to make a Command generate dracut args."""
+    def dracut_args(self, args, lineno, obj):
+        raise NotImplementedError
+
+# Here are the kickstart commands we care about:
+
+class DracutCdrom(Cdrom, DracutArgsMixin):
+    def dracut_args(self, args, lineno, obj):
+        return "inst.repo=cdrom"
+
+class DracutHardDrive(HardDrive, DracutArgsMixin):
+    def dracut_args(self, args, lineno, obj):
+        args = "inst.repo=hd:%s:%s" % (self.partition, self.dir)
+        # Escape spaces
+        return args.replace(" ", "\\x20")
+
+class DracutHmc(Hmc, DracutArgsMixin):
+    def dracut_args(self, args, lineno, obj):
+        return "inst.repo=hmc"
+
+class DracutNFS(NFS, DracutArgsMixin):
+    def dracut_args(self, args, lineno, obj):
+        if self.opts:
+            method = "nfs:%s:%s:%s" % (self.opts, self.server, self.dir)
+        else:
+            method="nfs:%s:%s" % (self.server, self.dir)
+
+        # Spaces on the cmdline need to be '\ '
+        method = method.replace(" ", "\\ ")
+        return "inst.repo=%s" % method
+
+class DracutURL(Url, DracutArgsMixin):
+    def dracut_args(self, args, lineno, obj):
+        # Spaces in the url need to be %20
+        if self.url:
+            method = self.url.replace(" ", "%20")
+        else:
+            method = None
+
+        args = ["inst.repo=%s" % method]
+
+        if self.noverifyssl:
+            args.append("rd.noverifyssl")
+        if self.proxy:
+            args.append("inst.proxy=%s" % self.proxy)
+
+        return "\n".join(args)
+
+class DracutUpdates(Updates, DracutArgsMixin):
+    def dracut_args(self, args, lineno, obj):
+        if self.url:
+            return "live.updates=%s" % self.url
+
+class DracutMediaCheck(MediaCheck, DracutArgsMixin):
+    def dracut_args(self, args, lineno, obj):
+        if self.mediacheck:
+            return "rd.live.check"
+
+class DracutDriverDisk(DriverDisk, DracutArgsMixin):
+    def dracut_args(self, args, lineno, obj):
+        dd_args = []
+        for dd in self.driverdiskList:
+            if dd.partition:
+                dd_args.append("inst.dd=hd:%s" % dd.partition)
+            elif dd.source:
+                dd_args.append("inst.dd=%s" % dd.source)
+            # TODO: find out if biospart is support is required for DD and remove this code if not
+            elif dd.biospart:
+                dd_args.append("inst.dd=bd:%s" % dd.biospart)
+
+        args = "\n".join(dd_args)
+        # Escape spaces
+        return args.replace(" ", "\\x20")
+
+class DracutNetwork(Network, DracutArgsMixin):
+    def dracut_args(self, args, lineno, obj):
+        '''
+        NOTE: The first 'network' line get special treatment:
+            * '--activate' is always enabled
+            * '--device' is optional (defaults to the 'ksdevice=' boot arg)
+            * the device gets brought online in initramfs
+        '''
+        net = obj
+        netline = None
+
+        # Setting only hostname in kickstart
+        if not net.device and not self.handler.ksdevice \
+           and setting_only_hostname(net, args):
+            return None
+
+        # first 'network' line
+        if len(self.network) == 1:
+            if net.activate is None:
+                net.activate = True
+            # Note that there may be no net.device and no ksdevice if inst.ks=file:/ks.cfg
+            # If that is the case, fall into ksnet_to_dracut with net.device=None and let
+            # it handle things.
+            if not net.device:
+                if self.handler.ksdevice:
+                    net.device = self.handler.ksdevice
+                    log.info("Using ksdevice %s for missing --device in first kickstart network command", self.handler.ksdevice)
+            if net.device == "link":
+                net.device = first_device_with_link()
+                if not net.device:
+                    log.warning("No device with link found for --device=link")
+                else:
+                    log.info("Using %s as first device with link found", net.device)
+            # tell dracut to bring this device up if it's not already done by user
+            if not "ip" in proc_cmdline:
+                netline = ksnet_to_dracut(args, lineno, net, bootdev=True)
+        else:
+            # all subsequent 'network' lines require '--device'
+            if not net.device or net.device == "link":
+                log.error("'%s': missing --device", " ".join(args))
+                return
+
+        return netline
+
+class DracutDisplayMode(DisplayMode, DracutArgsMixin):
+    def dracut_args(self, args, lineno, obj):
+        ret = ""
+        if self.displayMode == DISPLAY_MODE_CMDLINE:
+            ret = "inst.cmdline"
+        elif self.displayMode == DISPLAY_MODE_TEXT:
+            ret = "inst.text"
+        elif self.displayMode == DISPLAY_MODE_GRAPHICAL:
+            ret = "inst.graphical"
+
+        if self.nonInteractive:
+            ret += " inst.noninteractive"
+
+        return ret
+
+class DracutBootloader(Bootloader, DracutArgsMixin):
+    def dracut_args(self, args, lineno, obj):
+        if self.extlinux:
+            return "inst.extlinux"
+
+# FUTURE: keymap, lang... device? selinux?
+
+dracutCmds = {
+    'cdrom': DracutCdrom,
+    'harddrive': DracutHardDrive,
+    'hmc': DracutHmc,
+    'nfs': DracutNFS,
+    'url': DracutURL,
+    'updates': DracutUpdates,
+    'mediacheck': DracutMediaCheck,
+    'driverdisk': DracutDriverDisk,
+    'network': DracutNetwork,
+    'cmdline': DracutDisplayMode,
+    'graphical': DracutDisplayMode,
+    'text': DracutDisplayMode,
+    'bootloader': DracutBootloader,
+}
+
+handlerclass = returnClassForVersion(VERSION)
+
+class DracutHandler(handlerclass):
+    def __init__(self):
+        handlerclass.__init__(self, commandUpdates=dracutCmds)
+        self.output = []
+        self.ksdevice = None
+    def dispatcher(self, args, lineno):
+        obj = handlerclass.dispatcher(self, args, lineno)
+        # and execute any specified dracut_args
+        cmd = args[0]
+        # the commands member is implemented by the class returned
+        # by returnClassForVersion
+        # pylint: disable=no-member
+        command = self.commands[cmd]
+        if hasattr(command, "dracut_args"):
+            log.debug("kickstart line %u: handling %s", lineno, cmd)
+            self.output.append(command.dracut_args(args, lineno, obj))
+        return obj
+
+def init_logger(level=None):
+    if level is None and 'rd.debug' in proc_cmdline:
+        level = logging.DEBUG
+    logfmt = "%(name)s %(levelname)s: %(message)s"
+    logging.basicConfig(format=logfmt, level=level)
+    logger = logging.getLogger('parse-kickstart')
+    return logger
+
+def is_mac(addr):
+    return addr and len(addr) == 17 and addr.count(":") == 5 # good enough
+
+def find_devname(mac):
+    for netif in os.listdir("/sys/class/net"):
+        thismac = readsysfile("/sys/class/net/%s/address" % netif)
+        if thismac.lower() == mac.lower():
+            return netif
+
+def ksnet_to_dracut(args, lineno, net, bootdev=False):
+    '''Translate the kickstart network data into dracut network data.'''
+    # pylint: disable=redefined-outer-name
+    line = []
+    ip=""
+    autoconf=""
+
+    if is_mac(net.device): # this is a MAC - find the interface name
+        mac = net.device
+        # we need dev name to create dracut commands
+        net.device = find_devname(mac)
+        if net.device is None:  # iface not active - pick a name for it
+            try:
+                # find if 'ifname' command isn't already used for this device
+                # if so use user device name
+                for cmd_ifname in proc_cmdline["ifname"]:
+                    cmd_ifname, cmd_mac= cmd_ifname.split(":", 1)
+                    if mac == cmd_mac:
+                        net.device = cmd_ifname
+                        log.info("MAC '%s' is named by user. Use '%s' name.", mac, cmd_ifname)
+                        break
+            except KeyError:
+                log.debug("ifname= command isn't used generate name ksdev0 for device")
+        # if the device is still None use ksdev0 name
+        if net.device is None:
+            net.device = "ksdev0" # we only get called once, so this is OK
+            line.append("ifname=%s:%s" % (net.device, mac.lower()))
+
+    if net.device == "bootif":
+        if 'BOOTIF' in proc_cmdline:
+            bootif_mac = proc_cmdline["BOOTIF"][0][3:].replace("-", ":").upper()
+            net.device = find_devname(bootif_mac)
+        else:
+            net.device = None
+
+    # NOTE: dracut currently only does ipv4 *or* ipv6, so only one ip=arg..
+    if net.bootProto in (BOOTPROTO_DHCP, BOOTPROTO_BOOTP):
+        autoconf="dhcp"
+    elif net.bootProto == BOOTPROTO_IBFT:
+        autoconf="ibft"
+    elif net.bootProto == BOOTPROTO_QUERY:
+        log.error("'%s': --bootproto=query is deprecated", " ".join(args))
+    elif net.bootProto == BOOTPROTO_STATIC:
+        req = ("gateway", "netmask", "nameserver", "ip")
+        missing = ", ".join("--%s" % i for i in req if not hasattr(net, i))
+        if missing:
+            log.warning("line %u: network missing %s", lineno, missing)
+        else:
+            ip="{0.ip}::{0.gateway}:{0.netmask}:" \
+               "{0.hostname}:{0.device}:none:{0.mtu}".format(net)
+    elif net.ipv6 == "auto":
+        autoconf="auto6"
+    elif net.ipv6 == "dhcp":
+        autoconf="dhcp6"
+    elif net.ipv6:
+        ip="[{0.ipv6}]::{0.ipv6gateway}:{0.netmask}:" \
+           "{0.hostname}:{0.device}:none:{0.mtu}".format(net)
+
+    if autoconf:
+        if net.device or net.mtu:
+            ip="%s:%s:%s" % (net.device, autoconf, net.mtu)
+        else:
+            ip=autoconf
+
+    if ip:
+        line.append("ip=%s" % ip)
+
+    for ns in net.nameserver.split(","):
+        if ns:
+            line.append("nameserver=%s" % ns)
+
+    if bootdev:
+        if net.device:
+            line.append("bootdev=%s" % net.device)
+        # touch /tmp/net.ifaces to make sure dracut brings up network
+        open(TMPDIR+"/net.ifaces", "a")
+
+    if net.essid or net.wepkey or net.wpakey:
+        # NOTE: does dracut actually support wireless? (do we care?)
+        log.error("'%s': dracut doesn't support wireless networks",
+                      " ".join(args))
+    if net.bridgeslaves:
+        line.append("bridge=%s:%s" % (net.device, net.bridgeslaves))
+
+    if net.bondslaves:
+        line.append("bond=%s:%s:%s:%s" % (net.device, net.bondslaves, net.bondopts, net.mtu))
+
+    if net.teamslaves:
+        line = []
+        log.error("Network team configuration from kickstart in initramfs is not supported.")
+
+    if net.vlanid:
+        line = []
+        log.error("Network vlan configuration from kickstart in initramfs is not supported.")
+
+    return " ".join(line)
+
+def process_kickstart(ksfile):
+    handler = DracutHandler()
+    try:
+        # if the ksdevice key is present the first item must be there
+        # and it should be only once (ignore the orthers)
+        handler.ksdevice = proc_cmdline['ksdevice'][0]
+    except KeyError:
+        log.debug("ksdevice argument is not available")
+    parser = KickstartParser(handler, missingIncludeIsFatal=False, errorsAreFatal=False)
+    parser.registerSection(NullSection(handler, sectionOpen="%addon"))
+    log.info("processing kickstart file %s", ksfile)
+    processed_file = preprocessKickstart(ksfile)
+    try:
+        parser.readKickstart(processed_file)
+    except KickstartError as e:
+        log.error(str(e))
+    with open(TMPDIR+"/ks.info", "a") as f:
+        f.write('parsed_kickstart="%s"\n' % processed_file)
+    log.info("finished parsing kickstart")
+    return processed_file, handler.output
+
+if __name__ == '__main__':
+    log = init_logger()
+
+    # Override tmp directory path for testing. Don't use argparse because we don't want to
+    # include that dependency in the initramfs. Pass '--tmpdir /path/to/tmp/'
+    if "--tmpdir" in sys.argv:
+        idx = sys.argv.index("--tmpdir")
+        try:
+            sys.argv.pop(idx)
+            TMPDIR = os.path.normpath(sys.argv.pop(idx))
+        except IndexError:
+            pass
+
+    for path in sys.argv[1:]:
+        outfile, output = process_kickstart(path)
+        for line in (l for l in output if l):
+            print(line)

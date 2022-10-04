@@ -1,0 +1,126 @@
+#
+# DASD module.
+#
+# Copyright (C) 2018 Red Hat, Inc.
+#
+# This copyrighted material is made available to anyone wishing to use,
+# modify, copy, or redistribute it subject to the terms and conditions of
+# the GNU General Public License v.2, or (at your option) any later version.
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY expressed or implied, including the implied warranties of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General
+# Public License for more details.  You should have received a copy of the
+# GNU General Public License along with this program; if not, write to the
+# Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
+# 02110-1301, USA.  Any Red Hat trademarks that are incorporated in the
+# source code or documentation are not subject to the GNU General Public
+# License and may only be used or replicated with the express permission of
+# Red Hat, Inc.
+#
+from blivet import arch
+
+from pyanaconda.anaconda_loggers import get_module_logger
+from pyanaconda.core.dbus import DBus
+from pyanaconda.modules.common.base import KickstartBaseModule
+from pyanaconda.modules.common.constants.objects import DASD
+from pyanaconda.modules.common.errors.storage import UnavailableStorageError, UnknownDeviceError
+from pyanaconda.modules.storage.dasd.dasd_interface import DASDInterface
+from pyanaconda.modules.storage.dasd.discover import DASDDiscoverTask
+from pyanaconda.modules.storage.dasd.format import DASDFormatTask, FindFormattableDASDTask
+
+log = get_module_logger(__name__)
+
+
+class DASDModule(KickstartBaseModule):
+    """The DASD module."""
+
+    def __init__(self):
+        super().__init__()
+        self._storage = None
+        self._can_format_unformatted = False
+        self._can_format_ldl = False
+
+    def publish(self):
+        """Publish the module."""
+        DBus.publish_object(DASD.object_path, DASDInterface(self))
+
+    def is_supported(self):
+        """Is this module supported?"""
+        return arch.is_s390()
+
+    @property
+    def storage(self):
+        """The storage model.
+
+        :return: an instance of Blivet
+        :raise: UnavailableStorageError if not available
+        """
+        if self._storage is None:
+            raise UnavailableStorageError()
+
+        return self._storage
+
+    def _get_device(self, name):
+        """Find a device by its name.
+
+        :param name: a name of the device
+        :return: an instance of the Blivet's device
+        :raise: UnknownDeviceError if no device is found
+        """
+        device = self.storage.devicetree.get_device_by_name(name, hidden=True)
+
+        if not device:
+            raise UnknownDeviceError(name)
+
+        return device
+
+    def _get_devices(self, names):
+        """Find devices by their names.
+
+        :param names: names of the devices
+        :return: a list of instances of the Blivet's device
+        """
+        return list(map(self._get_device, names))
+
+    def on_storage_changed(self, storage):
+        """Keep the instance of the current storage."""
+        self._storage = storage
+
+    def on_format_unrecognized_enabled_changed(self, value):
+        """Update the flag for formatting unformatted DASDs."""
+        self._can_format_unformatted = value
+
+    def on_format_ldl_enabled_changed(self, value):
+        """Update the flags for formatting LDL DASDs."""
+        self._can_format_ldl = value
+
+    def discover_with_task(self, device_number):
+        """Discover a DASD.
+
+        :param device_number: a device number
+        :return: a task
+        """
+        return DASDDiscoverTask(device_number)
+
+    def find_formattable(self, disk_names):
+        """Find DASDs for formatting.
+
+        :param disk_names: a list of disk names to search
+        :return: a list of DASDs for formatting
+        """
+        task = FindFormattableDASDTask(
+            self._get_devices(disk_names),
+            self._can_format_unformatted,
+            self._can_format_ldl
+        )
+
+        found_disks = task.run()
+        return [d.name for d in found_disks]
+
+    def format_with_task(self, dasds):
+        """Format specified DASD disks.
+
+        :param dasds: a list of disk names
+        :return: a DBus path to a task
+        """
+        return DASDFormatTask(dasds)

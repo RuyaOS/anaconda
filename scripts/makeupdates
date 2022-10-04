@@ -1,0 +1,551 @@
+#!/usr/bin/python3
+#
+# makeupdates - Generate an updates.img containing changes since the last
+#               tag, but only changes to the main anaconda runtime.
+#               initrd/stage1 updates have to be created separately.
+#
+# Copyright (C) 2019  Red Hat, Inc.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU Lesser General Public License as published
+# by the Free Software Foundation; either version 2.1 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Lesser General Public License for more details.
+#
+# You should have received a copy of the GNU Lesser General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+import os
+import shutil
+import subprocess
+import sys
+import re
+import glob
+import multiprocessing
+import argparse
+import tempfile
+
+RPM_FOLDER_NAME = os.path.expanduser("~/.anaconda_updates_rpm_cache")
+RPM_RELEASE_DIR_TEMPLATE = "for_%s"
+
+# The Python site-packages path for pyanaconda.
+SITE_PACKAGES_PATH = "./usr/lib64/python3.10/site-packages/"
+COCKPIT_PACKAGES_PATH = "./usr/share/cockpit/anaconda-webui/"
+
+# Anaconda scripts that should be installed into the libexec folder
+LIBEXEC_SCRIPTS = ["log-capture", "start-module", "apply-updates"]
+
+
+def get_archive_tag(configure, spec):
+    tag = ""
+
+    with open(configure, "r") as f:
+        for line in f:
+            if line.startswith('AC_INIT('):
+                fields = line.split('[')
+                tag += fields[1].split(']')[0] + '-' + fields[2].split(']')[0]
+                break
+            else:
+                continue
+
+    with open(spec, "r") as f:
+        for line in f:
+            if line.startswith('Release:'):
+                release = '-' + line.split()[1].split('%')[0]
+                if "@PACKAGE_RELEASE@" in release:
+                    tag += "-1"
+                else:
+                    tag += release
+            else:
+                continue
+
+    return tag
+
+def get_archive_tag_offset(configure, spec, offset):
+    tag = get_archive_tag(configure, spec)
+
+    if not tag.count("-") >= 2:
+        return tag
+    ldash = tag.rfind("-")
+    bldash = tag[:ldash].rfind("-")
+    ver = tag[bldash+1:ldash]
+
+    if not ver.count(".") >= 1:
+        return tag
+    ver = ver[:ver.rfind(".")]
+
+    if not len(ver) > 0:
+        return tag
+    globstr = "refs/tags/" + tag[:bldash+1] + ver + ".*"
+    proc = subprocess.Popen(['git', 'for-each-ref', '--sort=taggerdate',
+                             '--format=%(tag)', globstr],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE).communicate()
+    lines = proc[0].strip("\n").split('\n')
+    lines.reverse()
+
+    try:
+        return lines[offset]
+    except IndexError:
+        return tag
+
+def get_anaconda_version():
+    """Get current anaconda version as string from the configure script"""
+    with open("configure.ac") as f:
+        match = re.search(r"AC_INIT\(\[.*\],\ \[(.*)\],\ \[.*\]\)", f.read())
+    return match.groups()[0]
+
+def get_fedora_version():
+    """Return integer representing current Fedora number,
+    based on Anaconda version"""
+    anaconda_version = get_anaconda_version()
+    return int(anaconda_version.split(".")[0])
+
+def get_req_tuple(pkg_tuple, version_request):
+    """Return package version requirements tuple
+
+    :param pkg_tuple: package metadata tuple
+    :type pkg_tuple: tuple
+    :param version_request: version request constant or None
+    :returns: version request tuple
+    :rtype: tuple
+    """
+    name, _arch, epoch, version, release = pkg_tuple
+    return (name, version_request, (epoch, version, release))
+
+def do_git_diff(tag, args=None):
+    if args is None:
+        args=[]
+    cmd = ['git', 'diff', '--name-status', tag] + args
+    proc = subprocess.Popen(cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE)
+    output, rc = proc.communicate()
+    output = output.decode("utf-8")
+
+    if proc.returncode:
+        raise RuntimeError("Error running %s: %s" % (" ".join(cmd), rc))
+
+    lines = output.split('\n')
+    return lines
+
+def do_git_content_diff(tag, args=None):
+    if args is None:
+        args = []
+    cmd = ['git', 'diff', tag] + args
+    proc = subprocess.Popen(cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE)
+    output, rc = proc.communicate()
+    output = output.decode("utf-8")
+
+    if rc:
+        raise RuntimeError("Error running %s: %s" % (" ".join(cmd), rc))
+
+    lines = output.split('\n')
+    return lines
+
+def create_RPM_cache_folder():
+    """Create RPM package cache folder if it does not already exist"""
+    if not os.path.exists(RPM_FOLDER_NAME):
+        os.makedirs(RPM_FOLDER_NAME)
+
+def copy_updated_files(tag, updates, cwd, builddir):
+    def install_to_dir(fname, relpath):
+        sys.stdout.write("Including %s\n" % fname)
+        outdir = os.path.join(updates, relpath)
+        if not os.path.isdir(outdir):
+            os.makedirs(outdir)
+        if os.path.isdir(fname):
+            shutil.copytree(fname, outdir, dirs_exist_ok=True)
+        else:
+            shutil.copy2(fname, outdir)
+
+    def install_gschema():
+        # Run make install to a temp directory and pull the compiled file out
+        # of it
+        tmpdir = tempfile.mkdtemp()
+        try:
+            os.system('make -C %s/data/window-manager/config install DESTDIR=%s' %
+                    (builddir,tmpdir))
+            # Find the .compiled file
+            for root, _dirs, files in os.walk(tmpdir):
+                for f in files:
+                    if f.endswith('.compiled'):
+                        install_to_dir(os.path.join(root, f),
+                                'usr/share/anaconda/window-manager/glib-2.0/schemas')
+        finally:
+            shutil.rmtree(tmpdir)
+
+    try:
+        lines = do_git_diff(tag)
+    except RuntimeError as e:
+        print("ERROR: %s" % e)
+        return
+
+    for line in lines:
+        fields = line.split()
+
+        if len(fields) < 2:
+            continue
+
+        status = fields[0]
+        gitfile = fields[1]
+
+        # R is followed by a number that doesn't matter to us.
+        if status == "D" or status[0] == "R":
+            if gitfile.startswith('pyanaconda/') and gitfile.endswith(".py"):
+                sys.stdout.write("Replacing %s\n" % gitfile)
+                file_path = os.path.join(updates, SITE_PACKAGES_PATH, gitfile)
+
+                if not os.path.exists(os.path.dirname(file_path)):
+                    os.makedirs(os.path.dirname(file_path))
+
+                with open(file_path, "w") as fobj:
+                    fobj.write('from pyanaconda.errors import RemovedModuleError\n')
+                    fobj.write('raise RemovedModuleError("This module no longer exists!")\n')
+
+            if status == "D":
+                continue
+            elif status[0] == "R":
+                gitfile = fields[2]
+
+        if gitfile.endswith('.spec.in') or (gitfile.find('Makefile') != -1) or \
+           gitfile.endswith('.c') or gitfile.endswith('.h') or \
+           gitfile.endswith('.sh'):
+            continue
+
+        if gitfile.endswith('.glade'):
+            # Some UI files should go under ui/<dir> where dir is the
+            # directory above the file.glade
+            dir_parts = os.path.dirname(gitfile).split(os.path.sep)
+            g_idx = dir_parts.index("gui")
+            uidir = os.path.sep.join(dir_parts[g_idx+1:])
+            install_to_dir(gitfile, os.path.join("usr/share/anaconda/ui/", uidir))
+        elif gitfile.startswith('pyanaconda/'):
+            dirname = os.path.join(SITE_PACKAGES_PATH, os.path.dirname(gitfile))
+            install_to_dir(gitfile, dirname)
+        elif gitfile.startswith('ui/webui'):
+            install_to_dir("ui/webui/dist", "usr/share/cockpit/anaconda-webui")
+        elif gitfile == 'anaconda.py':
+            # Install it as /usr/sbin/anaconda
+            if not os.path.isdir(os.path.join(updates, "usr/sbin")):
+                os.makedirs(os.path.join(updates, "usr/sbin"))
+            shutil.copy2(gitfile, os.path.join(updates, "usr/sbin/anaconda"))
+        elif gitfile.startswith("data/systemd"):
+            # include systemd services, but not for example dbus .service files
+            if gitfile.endswith('.service') or gitfile.endswith(".target"):
+                # same for systemd services
+                install_to_dir(gitfile, "usr/lib/systemd/system")
+            elif gitfile.endswith('/anaconda-generator'):
+                # yeah, this should probably be more clever..
+                install_to_dir(gitfile, "usr/lib/systemd/system-generators")
+        elif gitfile == "data/tmux.conf":
+            install_to_dir(gitfile, "usr/share/anaconda")
+        elif gitfile == "data/anaconda-gtk.css":
+            install_to_dir(gitfile, "usr/share/anaconda")
+        elif gitfile == "data/interactive-defaults.ks":
+            install_to_dir(gitfile, "usr/share/anaconda")
+        elif gitfile == "data/anaconda_options.txt":
+            install_to_dir(gitfile, "usr/share/anaconda")
+        elif gitfile == "data/anaconda.conf":
+            install_to_dir(gitfile, "etc/anaconda")
+        elif gitfile.startswith("data/conf.d"):
+            install_to_dir(gitfile, "etc/anaconda/conf.d")
+        elif gitfile.startswith("data/profile.d"):
+            install_to_dir(gitfile, "etc/anaconda/profile.d")
+        elif gitfile == "data/liveinst/liveinst":
+            install_to_dir(gitfile, "usr/sbin")
+        elif gitfile.startswith("data/liveinst/gnome"):
+            install_to_dir(gitfile, "usr/share/anaconda/gnome")
+        elif gitfile.startswith("data/pixmaps"):
+            install_to_dir(gitfile, "usr/share/anaconda/pixmaps")
+        elif gitfile.startswith("widgets/data/pixmaps"):
+            install_to_dir(gitfile, "usr/share/anaconda/pixmaps")
+        elif gitfile.startswith("data/ui/"):
+            install_to_dir(gitfile, "usr/share/anaconda/ui")
+        elif gitfile.startswith("data/window-manager/config"):
+            install_gschema()
+        elif gitfile.startswith("data/post-scripts/"):
+            install_to_dir(gitfile, "usr/share/anaconda/post-scripts")
+        elif gitfile == "utils/handle-sshpw":
+            install_to_dir(gitfile, "usr/sbin")
+        elif any(gitfile.endswith(libexec_script) for libexec_script in LIBEXEC_SCRIPTS):
+            install_to_dir(gitfile, "usr/libexec/anaconda")
+        elif gitfile.endswith("AnacondaWidgets.py"):
+            import gi
+            install_to_dir(gitfile, gi._overridesdir[1:])
+        elif gitfile.startswith("data/dbus"):
+            # add DBUS service and config files
+            if gitfile.endswith("anaconda-bus.conf"):
+                install_to_dir(gitfile, "usr/share/anaconda/dbus")
+            elif gitfile.endswith(".service"):
+                install_to_dir(gitfile, "usr/share/anaconda/dbus/services")
+            elif gitfile.endswith(".conf"):
+                install_to_dir(gitfile, "usr/share/anaconda/dbus/confs")
+
+
+def _compilableChanged(tag, compilable):
+    try:
+        lines = do_git_diff(tag, [compilable])
+    except RuntimeError as e:
+        print("ERROR: %s" % e)
+        return
+
+    for line in lines:
+        fields = line.split()
+
+        if len(fields) < 2:
+            continue
+
+        status = fields[0]
+        gitfile = fields[1]
+
+        if status == "D":
+            continue
+
+        if gitfile.startswith('Makefile') or gitfile.endswith('.h') or \
+           gitfile.endswith('.c') or gitfile.endswith('.py'):
+            return True
+
+    return False
+
+def isys_changed(tag):
+    return _compilableChanged(tag, 'pyanaconda/isys')
+
+def widgets_changed(tag):
+    return _compilableChanged(tag, 'widgets')
+
+def auditd_changed(tag):
+    return _compilableChanged(tag, 'pyanaconda/isys/auditd.c') or \
+            _compilableChanged(tag, 'pyanaconda/isys/auditd.h')
+
+def check_autotools(srcdir, builddir):
+    # Assumes that cwd is srcdir
+    if not os.path.isfile(os.path.join(builddir, 'Makefile')):
+        if not os.path.isfile('configure'):
+            os.system('./autogen.sh')
+        os.chdir(builddir)
+        os.system(os.path.join(srcdir, 'configure') + ' --prefix=`rpm --eval %_prefix`')
+        os.chdir(srcdir)
+
+def copy_updated_isys(updates, srcdir, builddir):
+    os.chdir(srcdir)
+    print("copy_updated_isys BUILDDIR %s" % builddir)
+
+    check_autotools(srcdir, builddir)
+
+    os.system('make -C %s -j %d' % (builddir, multiprocessing.cpu_count()))
+
+    outdir = os.path.join(updates, SITE_PACKAGES_PATH, "pyanaconda")
+    if not os.path.isdir(outdir):
+        os.makedirs(outdir)
+
+    isysmodule = os.path.realpath(os.path.join(builddir, 'pyanaconda/isys/.libs/_isys.so'))
+
+    if os.path.isfile(isysmodule):
+        sys.stdout.write("Including %s\n" % isysmodule)
+        shutil.copy2(isysmodule, outdir)
+
+def copy_updated_auditd(updates, srcdir, builddir):
+    os.chdir(srcdir)
+    print("copy_updated_isys BUILLDIR %s" % builddir)
+    auditdir = updates + '/usr/sbin'
+
+    check_autotools(srcdir, builddir)
+
+    os.system('make -C %s -j %d auditd' % (builddir + '/pyanaconda/isys', multiprocessing.cpu_count()))
+
+    # Copy the auditd binary to /usr/sbin
+    if not os.path.isdir(auditdir):
+        os.makedirs(auditdir)
+
+    auditd = builddir + '/pyanaconda/isys/auditd'
+    if os.path.isfile(auditd):
+        shutil.copy2(auditd, auditdir)
+
+def copy_updated_widgets(updates, srcdir, builddir):
+    os.chdir(srcdir)
+
+    if os.path.isdir("/usr/lib64"):
+        libdir = "/usr/lib64/"
+    else:
+        libdir = "/usr/lib/"
+
+    if not os.path.isdir(updates + libdir):
+        os.makedirs(updates + libdir)
+
+    if not os.path.isdir(updates + libdir + "girepository-1.0"):
+        os.makedirs(updates + libdir + "girepository-1.0")
+
+    check_autotools(srcdir, builddir)
+
+    os.system('make -C %s' % builddir)
+
+    libglob = os.path.normpath(builddir + "/widgets/src/.libs") + "/libAnacondaWidgets.so*"
+    for path in glob.glob(libglob):
+        if os.path.islink(path) and not os.path.exists(updates + libdir + os.path.basename(path)):
+            os.symlink(os.readlink(path), updates + libdir + os.path.basename(path))
+        elif os.path.isfile(path):
+            shutil.copy2(path, updates + libdir)
+
+    typeglob = os.path.realpath(builddir + "/widgets/src") + "/AnacondaWidgets-*.typelib"
+    for typelib in glob.glob(typeglob):
+        if os.path.isfile(typelib):
+            shutil.copy2(typelib, updates + libdir + "girepository-1.0")
+
+def copy_translations(updates, srcdir, builddir):
+    localedir = "/usr/share/locale/"
+
+    # Ensure all the message files are up to date
+    if os.system('make -C %s/po' % builddir) != 0:
+        sys.exit(1)
+
+    # From here gettext puts everything in $srcdir
+    # For each language in LINGUAS, install srcdir/<lang>.mo as
+    # /usr/share/locale/$language/LC_MESSAGES/anaconda.mo
+    with open(srcdir + '/po/LINGUAS') as linguas:
+        for line in linguas.readlines():
+            if line.startswith('#'):
+                continue
+
+            for lang in line.strip().split(" "):
+                if not os.path.isdir(updates + localedir + lang + "/LC_MESSAGES"):
+                    os.makedirs(updates + localedir + lang + "/LC_MESSAGES")
+
+                shutil.copy2(srcdir + "/po/" + lang + ".mo",
+                        updates + localedir + lang + "/LC_MESSAGES/anaconda.mo")
+
+def add_rpms(updates_path, rpms):
+    """Add content one or more RPM packages to the updates image
+
+    :param updates_path: path to the updates image folder
+    :type updates_path: string
+    :param rpms: list of paths to RPM files
+    :type rpms: list of strings
+    """
+    # convert all the RPM paths to absolute paths, so that
+    # relative paths can be used with -a/--add
+    rpms = map(os.path.abspath, rpms)
+
+    # resolve wildcards and also eliminate non-existing RPMs
+    resolved_rpms = []
+    for rpm in rpms:
+        resolved_path = glob.glob(rpm)
+        if not(resolved_path):
+            print("warning: requested rpm %s does not exist and can't be aded" % rpm)
+        elif len(resolved_path) > 1:
+            print("wildcard %s resolved to %d paths" % (rpm, len(resolved_path)))
+        resolved_rpms.extend(resolved_path)
+
+    for rpm in resolved_rpms:
+        cmd = "cd %s && rpm2cpio %s | cpio -dium" % (updates_path, rpm)
+        sys.stdout.write(cmd+"\n")
+        os.system(cmd)
+
+def create_updates_image(cwd, updates):
+    os.chdir(updates)
+    os.system("find . | cpio -c -o | pigz -9cv > %s/updates.img" % (cwd,))
+    sys.stdout.write("updates.img ready\n")
+
+class ExtendAction(argparse.Action):
+    """ A parsing action that extends a list of items instead of appending to
+        it. Useful where there is an option that can be used multiple times,
+        and each time the values yielded are a list, and a single list is
+        desired.
+    """
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, getattr(namespace, self.dest, []) + values)
+
+def main():
+    cwd = os.getcwd()
+    configure = os.path.realpath(os.path.join(cwd, 'configure.ac'))
+    spec = os.path.realpath(os.path.join(cwd, 'anaconda.spec.in'))
+    updates = os.path.join(cwd, 'updates')
+
+    parser = argparse.ArgumentParser(description="Make Anaconda updates image")
+
+    parser.add_argument('-k', '--keep', action='store_true',
+                        help='do not delete updates subdirectory')
+
+    parser.add_argument('-c', '--compile', action='store_true',
+                        help='compile code if there are isys changes')
+
+    parser.add_argument('-t', '--tag', action='store', type=str,
+                        help='make updates image from TAG to HEAD')
+
+    parser.add_argument('-o', '--offset', action='store', type=int, default=0,
+                        help='make image from (latest_tag - OFFSET) to HEAD')
+
+    parser.add_argument('-p', '--po', action='store_true',
+                        help='update translations')
+
+    parser.add_argument('-a', '--add', action=ExtendAction, type=str, nargs='+',
+                        dest='add_rpms', metavar='PATH_TO_RPM', default=[],
+                        help='add contents of RPMs to the updates image (glob supported)')
+
+    parser.add_argument('-b', '--builddir', action='store', type=str,
+                        metavar='BUILDDIR', help='build directory for shared objects')
+
+    args = parser.parse_args()
+
+    if not os.path.isfile(configure) and not os.path.isfile(spec):
+        sys.stderr.write("You must be at the top level of the anaconda source tree.\n")
+        sys.exit(1)
+
+    if not args.tag:
+        # add a fake tag to the arguments to be consistent
+        if args.offset < 1:
+            args.tag = get_archive_tag(configure, spec)
+        else:
+            args.tag = get_archive_tag_offset(configure, spec, args.offset)
+        sys.stdout.write("Using tag: %s\n" % args.tag)
+
+    if args.builddir:
+        if os.path.isabs(args.builddir):
+            builddir = args.builddir
+        else:
+            builddir = os.path.join(cwd, args.builddir)
+    else:
+        builddir = cwd
+
+    print("Using site-packages path: %s\n" % SITE_PACKAGES_PATH)
+
+    if not os.path.isdir(updates):
+        os.makedirs(updates)
+
+    copy_updated_files(args.tag, updates, cwd, builddir)
+
+    if args.compile:
+        if isys_changed(args.tag):
+            copy_updated_isys(updates, cwd, builddir)
+
+        if widgets_changed(args.tag):
+            copy_updated_widgets(updates, cwd, builddir)
+
+        if auditd_changed(args.tag):
+            copy_updated_auditd(updates, cwd, builddir)
+
+    if args.po:
+        copy_translations(updates, cwd, builddir)
+
+    if args.add_rpms:
+        args.add_rpms = list(set(args.add_rpms))
+        print('%d RPMs added manually:' % len(args.add_rpms))
+        for item in args.add_rpms:
+            print(os.path.basename(item))
+
+    if args.add_rpms:
+        add_rpms(updates, args.add_rpms)
+
+    create_updates_image(cwd, updates)
+
+    if not args.keep:
+        shutil.rmtree(updates)
+
+if __name__ == "__main__":
+    main()

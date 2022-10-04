@@ -1,0 +1,55 @@
+#!/usr/bin/python3
+#
+# handle-sshpw:  Code processing sshpw lines in kickstart files for the
+#                install environment.
+#
+# Copyright (C) 2012-2015 Red Hat, Inc.  All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+# Some of this code comes from the old pyanaconda/sshd.py
+#
+import os
+import sys
+from pykickstart.parser import KickstartParser
+from pykickstart.version import makeVersion
+from pykickstart.sections import NullSection
+import pyanaconda.core.users as users
+from pyanaconda.core.kickstart.version import VERSION
+
+ksfile = '/run/install/ks.cfg'
+
+# see if we have a file to work with
+if not os.path.exists(ksfile):
+    sys.exit()
+
+handler = makeVersion(VERSION)
+ksparser = KickstartParser(handler, missingIncludeIsFatal=False)
+ksparser.registerSection(NullSection(handler, sectionOpen="%addon"))
+ksparser.readKickstart(ksfile)
+
+userdata = ksparser.handler.sshpw.dataList()
+for ud in userdata:
+    if users.check_user_exists(ud.username, root="/"):
+        if not ud.sshkey:
+            users.set_user_password(username=ud.username, password=ud.password,
+                                    is_crypted=ud.isCrypted, lock=ud.lock)
+    else:
+        users.create_user(username=ud.username, password=ud.password, is_crypted=ud.isCrypted,
+                          lock=ud.lock, root="/")
+
+    if ud.sshkey:
+        # Setup the account so that only the sshkey can be used
+        users.set_user_password(username=ud.username, password="*", is_crypted=True, lock=False)
+        users.set_user_ssh_key(username=ud.username, key=ud.password, root="/")

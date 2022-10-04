@@ -1,0 +1,18 @@
+[Unit]
+Description=Anaconda System Services
+Requires=basic.target
+After=basic.target
+AllowIsolate=yes
+Wants=instperf.service
+Wants=rsyslog.service
+Wants=systemd-udev-settle.service
+Wants=NetworkManager.service
+Wants=plymouth-quit.service plymouth-quit-wait.service
+Wants=anaconda-direct.service anaconda.service
+Wants=anaconda-sshd.service
+Wants=anaconda-pre.service
+Wants=anaconda-fips.service
+Wants=systemd-logind.service
+Wants=brltty.service
+Wants=rhsm.service
+After=rhsm.service

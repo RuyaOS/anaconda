@@ -1,0 +1,20 @@
+[Unit]
+Description=Anaconda Text Console
+Requires=anaconda.service
+After=anaconda.target anaconda.service
+ConditionPathIsDirectory=!/sys/hypervisor/s390
+ConditionKernelCommandLine=!inst.notmux
+
+[Service]
+Type=idle
+WorkingDirectory=/root
+Environment=LANG=en_US.UTF-8
+ExecStart=/usr/bin/tmux -u attach -t anaconda
+StandardInput=tty
+StandardOutput=tty
+TTYPath=/dev/%I
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+Restart=always
+RestartSec=0

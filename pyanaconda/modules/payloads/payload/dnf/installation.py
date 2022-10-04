@@ -1,0 +1,339 @@
+#
+# Copyright (C) 2020  Red Hat, Inc.
+#
+# This copyrighted material is made available to anyone wishing to use,
+# modify, copy, or redistribute it subject to the terms and conditions of
+# the GNU General Public License v.2, or (at your option) any later version.
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY expressed or implied, including the implied warranties of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General
+# Public License for more details.  You should have received a copy of the
+# GNU General Public License along with this program; if not, write to the
+# Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
+# 02110-1301, USA.  Any Red Hat trademarks that are incorporated in the
+# source code or documentation are not subject to the GNU General Public
+# License and may only be used or replicated with the express permission of
+# Red Hat, Inc.
+#
+import os
+import shutil
+import rpm
+
+from pyanaconda.anaconda_loggers import get_module_logger
+from pyanaconda.core import util
+from pyanaconda.core.configuration.anaconda import conf
+from pyanaconda.core.constants import RPM_LANGUAGES_NONE, RPM_LANGUAGES_ALL, MULTILIB_POLICY_BEST
+from pyanaconda.core.i18n import _
+from pyanaconda.modules.common.errors.installation import PayloadInstallationError, \
+    NonCriticalInstallationError
+from pyanaconda.modules.common.structures.packages import PackagesConfigurationData
+from pyanaconda.modules.common.task import Task
+from pyanaconda.modules.payloads.payload.dnf.requirements import collect_remote_requirements, \
+    collect_language_requirements, collect_platform_requirements, \
+    collect_driver_disk_requirements, apply_requirements
+from pyanaconda.modules.payloads.payload.dnf.utils import pick_download_location
+from pyanaconda.modules.payloads.payload.dnf.validation import CheckPackagesSelectionTask
+
+log = get_module_logger(__name__)
+
+
+class SetRPMMacrosTask(Task):
+    """Installation task to set RPM macros."""
+
+    def __init__(self, data: PackagesConfigurationData):
+        """Create a task.
+
+        :param data: a packages configuration data
+        """
+        super().__init__()
+        self._data = data
+        self._macros = []
+
+    @property
+    def name(self):
+        """The name of the task."""
+        return "Set RPM macros"
+
+    def run(self):
+        """Run the task."""
+        self._macros = self._collect_macros(self._data)
+        self._install_macros(self._macros)
+
+    def _collect_macros(self, data: PackagesConfigurationData):
+        """Collect the RPM macros."""
+        macros = list()
+
+        # nofsync speeds things up at the risk of rpmdb data loss in a crash.
+        # But if we crash mid-install you're boned anyway, so who cares?
+        macros.append(('__dbi_htconfig', 'hash nofsync %{__dbi_other} %{__dbi_perms}'))
+
+        if data.docs_excluded:
+            macros.append(('_excludedocs', '1'))
+
+        if data.languages == RPM_LANGUAGES_NONE:
+            macros.append(('_install_langs', '%{nil}'))
+        elif data.languages != RPM_LANGUAGES_ALL:
+            macros.append(('_install_langs', data.languages))
+
+        if conf.security.selinux:
+            for d in ["/etc/selinux/targeted/contexts/files",
+                      "/etc/security/selinux/src/policy",
+                      "/etc/security/selinux"]:
+                f = d + "/file_contexts"
+                if os.access(f, os.R_OK):
+                    macros.append(('__file_context_path', f))
+                    break
+        else:
+            macros.append(('__file_context_path', '%{nil}'))
+
+        return macros
+
+    def _install_macros(self, macros):
+        """Add RPM macros to the global transaction environment."""
+        for name, value in macros:
+            log.debug("Set '%s' to '%s'.", name, value)
+            rpm.addMacro(name, value)
+
+
+class ResolvePackagesTask(CheckPackagesSelectionTask):
+    """Installation task to resolve the software selection."""
+
+    @property
+    def name(self):
+        """The name of the task."""
+        return "Resolve packages"
+
+    def run(self):
+        """Run the task.
+
+        :raise PayloadInstallationError: if the selection cannot be resolved
+        :raise NonCriticalInstallationError: if the selection is resolved with warnings
+        """
+        report = super().run()
+
+        if report.error_messages:
+            message = "\n\n".join(report.error_messages)
+            log.error("The packages couldn't be resolved:\n\n%s", message)
+            raise PayloadInstallationError(message)
+
+        if report.warning_messages:
+            message = "\n\n".join(report.warning_messages)
+            log.warning("The packages were resolved with warnings:\n\n%s", message)
+            raise NonCriticalInstallationError(message)
+
+    @property
+    def _requirements(self):
+        """Requirements for installing packages and groups.
+
+        :return: a list of requirements
+        """
+        return collect_remote_requirements() \
+            + collect_language_requirements(self._dnf_manager) \
+            + collect_platform_requirements(self._dnf_manager) \
+            + collect_driver_disk_requirements()
+
+    def _collect_required_specs(self):
+        """Collect specs for the required software."""
+        super()._collect_required_specs()
+
+        # Apply requirements.
+        apply_requirements(self._requirements, self._include_list, self._exclude_list)
+
+
+class PrepareDownloadLocationTask(Task):
+    """The installation task for setting up the download location."""
+
+    def __init__(self, dnf_manager):
+        """Create a new task.
+
+        :param dnf_manager: a DNF manager
+        """
+        super().__init__()
+        self._dnf_manager = dnf_manager
+
+    @property
+    def name(self):
+        return "Prepare the package download"
+
+    def run(self):
+        """Run the task.
+
+        :return: a path of the download location
+        """
+        path = pick_download_location(self._dnf_manager)
+
+        if os.path.exists(path):
+            log.info("Removing existing package download location: %s", path)
+            shutil.rmtree(path)
+
+        self._dnf_manager.set_download_location(path)
+        return path
+
+
+class CleanUpDownloadLocationTask(Task):
+    """The installation task for cleaning up the download location."""
+
+    def __init__(self, dnf_manager):
+        """Create a new task.
+
+        :param dnf_manager: a DNF manager
+        """
+        super().__init__()
+        self._dnf_manager = dnf_manager
+
+    @property
+    def name(self):
+        return "Remove downloaded packages"
+
+    def run(self):
+        """Run the task.
+
+        Some installation sources, such as NFS, don't need to download packages to
+        local storage, so the download location might not always exist. See the bug
+        1193121 for more information.
+        """
+        path = self._dnf_manager.download_location
+
+        if not os.path.exists(path):
+            log.warning("The download location %s doesn't exist.", path)
+            return
+
+        log.info("Removing downloaded packages from %s.", path)
+        shutil.rmtree(path)
+
+
+class DownloadPackagesTask(Task):
+    """The installation task for downloading the packages."""
+
+    def __init__(self, dnf_manager):
+        """Create a new task.
+
+        :param dnf_manager: a DNF manager
+        """
+        super().__init__()
+        self._dnf_manager = dnf_manager
+
+    @property
+    def name(self):
+        return "Download packages"
+
+    def run(self):
+        self.report_progress(_("Downloading packages"))
+        self._dnf_manager.download_packages(self.report_progress)
+
+
+class InstallPackagesTask(Task):
+    """The installation task for installing the packages."""
+
+    def __init__(self, dnf_manager):
+        """Create a new task.
+
+        :param dnf_manager: a DNF manager
+        """
+        super().__init__()
+        self._dnf_manager = dnf_manager
+
+    @property
+    def name(self):
+        return "Install packages"
+
+    def run(self):
+        """Run the task."""
+        self.report_progress(_("Preparing transaction from installation source"))
+        self._dnf_manager.install_packages(self.report_progress)
+
+
+class ImportRPMKeysTask(Task):
+    """The installation task for import of the RPM keys."""
+
+    def __init__(self, sysroot, gpg_keys):
+        """Create a new task.
+
+        :param sysroot: a path to the system root
+        :param gpg_keys: a list of gpg keys to import
+        """
+        super().__init__()
+        self._sysroot = sysroot
+        self._gpg_keys = gpg_keys
+
+    @property
+    def name(self):
+        return "Import RPM keys"
+
+    def run(self):
+        """Run the task"""
+        if not self._gpg_keys:
+            log.debug("No GPG keys to import.")
+            return
+
+        if not os.path.exists(self._sysroot + "/usr/bin/rpm"):
+            log.error(
+                "Can not import GPG keys to RPM database because "
+                "the 'rpm' executable is missing on the target "
+                "system. The following keys were not imported:\n%s",
+                "\n".join(self._gpg_keys)
+            )
+            return
+
+        # Get substitutions for variables.
+        # TODO: replace the interpolation with DNF once possible
+        basearch = util.execWithCapture("uname", ["-i"]).strip().replace("'", "")
+        releasever = util.get_os_release_value("VERSION_ID", sysroot=self._sysroot) or ""
+
+        # Import GPG keys to RPM database.
+        for key in self._gpg_keys:
+            key = key.replace("$releasever", releasever).replace("$basearch", basearch)
+
+            log.info("Importing GPG key to RPM database: %s", key)
+            rc = util.execWithRedirect("rpm", ["--import", key], root=self._sysroot)
+
+            if rc:
+                log.error("Failed to import the GPG key.")
+
+
+class UpdateDNFConfigurationTask(Task):
+    """The installation task to update the dnf.conf file."""
+
+    def __init__(self, sysroot, data: PackagesConfigurationData):
+        """Create a new task.
+
+        :param sysroot: a path to the system root
+        :param data: a packages configuration data
+        """
+        super().__init__()
+        self._sysroot = sysroot
+        self._data = data
+
+    @property
+    def name(self):
+        return "Update DNF configuration"
+
+    def run(self):
+        """Run the task."""
+        if self._data.multilib_policy != MULTILIB_POLICY_BEST:
+            self._set_option("multilib_policy", self._data.multilib_policy)
+
+    def _set_option(self, option, value):
+        """Set a configuration option.
+
+        :param option: a name of the option
+        :param value: a value of the option
+        """
+        log.debug("Setting '%s' to '%s'.", option, value)
+
+        cmd = "dnf"
+        args = [
+            "config-manager",
+            "--save",
+            "--setopt={}={}".format(option, value),
+        ]
+
+        try:
+            rc = util.execWithRedirect(cmd, args, root=self._sysroot)
+        except OSError as e:
+            log.warning("Couldn't update the DNF configuration: %s", e)
+            return
+
+        if rc != 0:
+            log.warning("Failed to update the DNF configuration (%s).", rc)
+            return
